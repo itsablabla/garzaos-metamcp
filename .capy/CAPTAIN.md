@@ -99,15 +99,37 @@ Before submitting any substantial request to another agent, MCP tool, automation
 6. If no skill exists but the task is recurring or specialized, use the skills MCP/database to create, download, or store a reusable skill for future agents, then proceed.
 7. Do not block urgent or simple work indefinitely if `prompts-chat` is unavailable; continue with best effort and note the missed optimization opportunity.
 
+## Router invocation pattern
+
+The brand router exposes five meta-tools per endpoint:
+
+- `<brand>` convenience router tool
+- `search_brands`
+- `get_brand_tools`
+- `get_tool_schema`
+- `execute_tool`
+
+Do real work through `execute_tool`:
+
+```json
+{
+  "brand": "tavily",
+  "tool": "tavily_search",
+  "arguments": { "query": "example" }
+}
+```
+
+Do not call downstream prefixed tools such as `tavily__tavily_search` directly as router tool names; direct calls return `Unknown router tool`. Use `get_brand_tools` first to discover available downstream tool names, then pass the selected name to `execute_tool`.
+
 ## Tool selection policy
 
 - Use `prompts-chat` as the prompt and skills database. Check it before every substantial request, not only ambiguous requests.
-- Use `context7` before writing SDK/library/framework code. Resolve the library ID first, then query docs.
+- Use `context7` before writing SDK/library/framework code. For `resolve-library-id`, provide both `query` and `libraryName`; the schema requires both even though the description can read like alternatives.
 - Use `firecrawl` for static web search/scraping/extraction.
-- Use `hyperbrowser` for JavaScript-heavy pages, browser automation, screenshots, logins, and SPA workflows.
+- Do not route browser automation through MetaMCP `hyperbrowser` right now: the catalog registers tools, but execution returns `Unknown tool` for `hyperbrowser__*`. Use `firecrawl`/`tavily` when sufficient, or connect to Hyperbrowser MCP directly outside MetaMCP until the router config is fixed.
 - Use `tavily` for fast web search/research.
-- Use `e2b` for sandboxed code execution.
-- Use `onepass` for 1Password access. Always target vault `Main` when a vault is required.
+- Use `e2b` for sandboxed code execution. Cold starts can exceed the router execution timeout; pre-warm the sandbox or retry if the first `e2b__run_code` call times out.
+- Use `onepass` for 1Password access. Always target vault `Main`; the current token only exposes `Main`.
 - Use `tailscale` only for network administration tasks; treat it as high-risk.
 - Use `composio` for broad SaaS/app connector discovery and execution.
 - Use `mem0` for persistent memory operations.
@@ -115,6 +137,7 @@ Before submitting any substantial request to another agent, MCP tool, automation
 ## Known unreliable or environment-bound tools
 
 - `beeper-local` and `beeper-oakhost` currently expose zero/unknown tools or depend on local network tunnels. Do not rely on them for critical flows.
+- `hyperbrowser` through MetaMCP is currently broken for execution despite catalog discovery. Bypass MetaMCP for Hyperbrowser until fixed.
 - `prompts-chat` may time out from the MetaMCP VM. It is still the required first choice for prompt/skill lookup, but do not let it block urgent work.
 - Endpoints that reference `oakhost`, `100.121.182.67`, or local Beeper/Proton Bridge services may fail from cloud-hosted agents unless the relevant Tailscale tunnel is reachable.
 

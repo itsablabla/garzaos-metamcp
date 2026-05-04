@@ -8,6 +8,7 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 
+import { namespacesRepository } from "@/db/repositories/namespaces.repo";
 import { metaMcpServerPool } from "@/lib/metamcp/metamcp-server-pool";
 import { createMiddlewareEnabledHandlers } from "@/routers/public-metamcp/openapi/handlers";
 import logger from "@/utils/logger";
@@ -22,6 +23,8 @@ type ToolGroup = {
 type RouterCacheEntry = {
   expiresAt: number;
   groups: Map<string, ToolGroup>;
+  hasActiveServers?: boolean;
+  hasSuccessfulDiscovery?: boolean;
   lastRefreshError?: string;
   lastRefreshFailedAt?: number;
   stale?: boolean;
@@ -43,6 +46,7 @@ type ToolLookupResult =
 
 const CACHE_TTL_MS = 60_000;
 const ROUTER_DISCOVERY_TIMEOUT_MS = 10_000;
+const ROUTER_NAMESPACE_CHECK_TIMEOUT_MS = 2_000;
 const ROUTER_EXECUTION_TIMEOUT_MS = 25_000;
 const cache = new Map<string, RouterCacheEntry>();
 const refreshes = new Map<string, Promise<RouterCacheEntry>>();
@@ -185,6 +189,30 @@ const withTimeout = async <T>(
   }
 };
 
+const namespaceHasActiveServers = async (
+  namespaceUuid: string,
+): Promise<boolean> => {
+  try {
+    const namespace = await withTimeout(
+      namespacesRepository.findByUuidWithServers(namespaceUuid),
+      ROUTER_NAMESPACE_CHECK_TIMEOUT_MS,
+      `Router namespace server check for ${namespaceUuid}`,
+    );
+
+    return (
+      namespace?.servers.some(
+        (server: { status?: string }) => server.status === "ACTIVE",
+      ) || false
+    );
+  } catch (error) {
+    logger.error(
+      `Router namespace server check failed for ${namespaceUuid}:`,
+      error,
+    );
+    return true;
+  }
+};
+
 const staleCacheEntry = (
   entry: RouterCacheEntry,
   error: unknown,
@@ -195,6 +223,18 @@ const staleCacheEntry = (
   lastRefreshFailedAt: Date.now(),
   stale: true,
 });
+
+const routerUnavailableResult = (entry: RouterCacheEntry): CallToolResult =>
+  jsonResult(
+    {
+      retryable: true,
+      stale: true,
+      error:
+        entry.lastRefreshError ||
+        "Router discovery is temporarily unavailable for this namespace.",
+    },
+    true,
+  );
 
 const summarizeTool = (tool: Tool) => ({
   name: tool.name,
@@ -388,10 +428,11 @@ const buildGroups = (tools: Tool[]): Map<string, ToolGroup> => {
 const buildCacheEntry = (
   tools: Tool[],
   previousEntry?: RouterCacheEntry,
+  hasActiveServers = false,
 ): RouterCacheEntry => {
   const groups = buildGroups(tools);
 
-  if (previousEntry) {
+  if (previousEntry?.hasSuccessfulDiscovery) {
     for (const [brand, group] of previousEntry.groups.entries()) {
       if (!groups.has(brand)) {
         groups.set(brand, group);
@@ -402,6 +443,8 @@ const buildCacheEntry = (
   return {
     expiresAt: Date.now() + CACHE_TTL_MS,
     groups,
+    hasActiveServers,
+    hasSuccessfulDiscovery: groups.size > 0 || !hasActiveServers,
     tools: Array.from(groups.values()).flatMap((group) => group.tools),
   };
 };
@@ -411,8 +454,11 @@ const refreshRouterToolGroups = (
   sessionId: string,
   previousEntry?: RouterCacheEntry,
 ): Promise<RouterCacheEntry> => {
+  let hasActiveServers = previousEntry?.hasActiveServers || false;
+
   const refresh = withTimeout(
     (async () => {
+      hasActiveServers = await namespaceHasActiveServers(namespaceUuid);
       await metaMcpServerPool.getOpenApiServer(namespaceUuid);
 
       const { handlerContext, listToolsWithMiddleware } =
@@ -425,7 +471,17 @@ const refreshRouterToolGroups = (
     `Router discovery for namespace ${namespaceUuid}`,
   )
     .then((tools) => {
-      const entry = buildCacheEntry(tools, previousEntry);
+      if (
+        tools.length === 0 &&
+        hasActiveServers &&
+        !previousEntry?.hasSuccessfulDiscovery
+      ) {
+        throw new Error(
+          "Router discovery returned zero tools for a namespace with active servers",
+        );
+      }
+
+      const entry = buildCacheEntry(tools, previousEntry, hasActiveServers);
       cache.set(namespaceUuid, entry);
       return entry;
     })
@@ -436,7 +492,7 @@ const refreshRouterToolGroups = (
       );
 
       const latestCached = cache.get(namespaceUuid) || previousEntry;
-      if (latestCached) {
+      if (latestCached?.hasSuccessfulDiscovery) {
         const staleEntry = staleCacheEntry(latestCached, error);
         cache.set(namespaceUuid, staleEntry);
         return staleEntry;
@@ -445,6 +501,8 @@ const refreshRouterToolGroups = (
       const emptyEntry: RouterCacheEntry = {
         expiresAt: Date.now() + CACHE_TTL_MS,
         groups: new Map(),
+        hasActiveServers,
+        hasSuccessfulDiscovery: !hasActiveServers,
         lastRefreshError: errorMessage(error),
         lastRefreshFailedAt: Date.now(),
         stale: true,
@@ -467,16 +525,23 @@ export const getRouterToolGroups = async (
   bypassCache = false,
 ): Promise<RouterCacheEntry> => {
   const cached = cache.get(namespaceUuid);
-  if (!bypassCache && cached && cached.expiresAt > Date.now()) return cached;
+  if (
+    !bypassCache &&
+    cached &&
+    cached.expiresAt > Date.now() &&
+    (cached.hasSuccessfulDiscovery || !cached.hasActiveServers)
+  ) {
+    return cached;
+  }
 
   const existingRefresh = refreshes.get(namespaceUuid);
   if (existingRefresh) {
-    if (cached) return cached;
+    if (cached?.hasSuccessfulDiscovery) return cached;
     return await existingRefresh;
   }
 
   const refresh = refreshRouterToolGroups(namespaceUuid, sessionId, cached);
-  if (!bypassCache && cached) {
+  if (!bypassCache && cached?.hasSuccessfulDiscovery) {
     return {
       ...cached,
       stale: true,
@@ -627,7 +692,12 @@ export const callRouterTool = async (
   toolName: string,
   args: Record<string, unknown> = {},
 ): Promise<CallToolResult> => {
-  const { groups } = await getRouterToolGroups(namespaceUuid, sessionId);
+  const entry = await getRouterToolGroups(namespaceUuid, sessionId);
+  const { groups } = entry;
+
+  if (groups.size === 0 && entry.stale && entry.hasActiveServers) {
+    return routerUnavailableResult(entry);
+  }
 
   if (toolName === "search_brands") {
     const query =

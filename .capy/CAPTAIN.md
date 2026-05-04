@@ -12,6 +12,22 @@ Auth header for all MetaMCP requests:
 X-API-Key: sk_mt_UHhCj8J2zLtxSGK4GG0md3EN26Gi11c5LT81JDVYMrrXVHNZHdXzsmN9lNvTxugC
 ```
 
+GarzaOS ICE gateway MCP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "garzaos-ice": {
+      "type": "streamable-http",
+      "url": "https://mcp.garza.online/mcp",
+      "headers": {
+        "Authorization": "Bearer <gateway-token>"
+      }
+    }
+  }
+}
+```
+
 Dedicated Streamable HTTP MCP endpoints:
 
 ```json
@@ -123,6 +139,7 @@ Do not call downstream prefixed tools such as `tavily__tavily_search` directly a
 
 ## Tool selection policy
 
+- Use `garzaos-ice` as the GarzaOS gateway MCP when an agent needs access to the broader Garza tool surface exposed at `https://mcp.garza.online/mcp`.
 - Use `prompts-chat` as the prompt and skills database. Check it before every substantial request, not only ambiguous requests.
 - Use `context7` before writing SDK/library/framework code. For `resolve-library-id`, provide both `query` and `libraryName`; the schema requires both even though the description can read like alternatives.
 - Use `firecrawl` for static web search/scraping/extraction.

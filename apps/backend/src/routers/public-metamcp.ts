@@ -5,6 +5,7 @@ import logger from "@/utils/logger";
 
 import { endpointsRepository } from "../db/repositories/endpoints.repo";
 import { openApiRouter } from "./public-metamcp/openapi";
+import { toolRouter } from "./public-metamcp/router";
 import sseRouter from "./public-metamcp/sse";
 import streamableHttpRouter from "./public-metamcp/streamable-http";
 
@@ -37,6 +38,9 @@ publicEndpointsRouter.use((req, res, next) => {
 // Use StreamableHTTP router for /mcp routes
 publicEndpointsRouter.use(streamableHttpRouter);
 
+// Use brand-level router for /router/mcp and /router/api routes
+publicEndpointsRouter.use(toolRouter);
+
 // Use SSE router for /sse and /message routes
 publicEndpointsRouter.use(sseRouter);
 
@@ -64,6 +68,8 @@ publicEndpointsRouter.get("/", async (req, res) => {
         sse: `/metamcp/${endpoint.name}/sse`,
         api: `/metamcp/${endpoint.name}/api`,
         openapi: `/metamcp/${endpoint.name}/api/openapi.json`,
+        routerMcp: `/metamcp/${endpoint.name}/router/mcp`,
+        routerApi: `/metamcp/${endpoint.name}/router/api/openapi.json`,
       },
     }));
 

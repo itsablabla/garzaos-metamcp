@@ -22,6 +22,9 @@ type ToolGroup = {
 type RouterCacheEntry = {
   expiresAt: number;
   groups: Map<string, ToolGroup>;
+  lastRefreshError?: string;
+  lastRefreshFailedAt?: number;
+  stale?: boolean;
   tools: Tool[];
 };
 
@@ -39,7 +42,10 @@ type ToolLookupResult =
   | { status: "ambiguous"; matchingTools: Tool[] };
 
 const CACHE_TTL_MS = 60_000;
+const ROUTER_DISCOVERY_TIMEOUT_MS = 10_000;
+const ROUTER_EXECUTION_TIMEOUT_MS = 25_000;
 const cache = new Map<string, RouterCacheEntry>();
+const refreshes = new Map<string, Promise<RouterCacheEntry>>();
 
 const brandToolInputSchema: ToolInputSchema = {
   type: "object",
@@ -154,6 +160,40 @@ const jsonResult = (payload: unknown, isError = false): CallToolResult => ({
     },
   ],
   isError,
+});
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const withTimeout = async <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  operation: string,
+): Promise<T> => {
+  let timeout: NodeJS.Timeout | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+const staleCacheEntry = (
+  entry: RouterCacheEntry,
+  error: unknown,
+): RouterCacheEntry => ({
+  ...entry,
+  expiresAt: Date.now() + CACHE_TTL_MS,
+  lastRefreshError: errorMessage(error),
+  lastRefreshFailedAt: Date.now(),
+  stale: true,
 });
 
 const summarizeTool = (tool: Tool) => ({
@@ -345,6 +385,82 @@ const buildGroups = (tools: Tool[]): Map<string, ToolGroup> => {
   return groups;
 };
 
+const buildCacheEntry = (
+  tools: Tool[],
+  previousEntry?: RouterCacheEntry,
+): RouterCacheEntry => {
+  const groups = buildGroups(tools);
+
+  if (previousEntry) {
+    for (const [brand, group] of previousEntry.groups.entries()) {
+      if (!groups.has(brand)) {
+        groups.set(brand, group);
+      }
+    }
+  }
+
+  return {
+    expiresAt: Date.now() + CACHE_TTL_MS,
+    groups,
+    tools: Array.from(groups.values()).flatMap((group) => group.tools),
+  };
+};
+
+const refreshRouterToolGroups = (
+  namespaceUuid: string,
+  sessionId: string,
+  previousEntry?: RouterCacheEntry,
+): Promise<RouterCacheEntry> => {
+  const refresh = withTimeout(
+    (async () => {
+      await metaMcpServerPool.getOpenApiServer(namespaceUuid);
+
+      const { handlerContext, listToolsWithMiddleware } =
+        createMiddlewareEnabledHandlers(sessionId, namespaceUuid);
+      const request: ListToolsRequest = { method: "tools/list", params: {} };
+      const result = await listToolsWithMiddleware(request, handlerContext);
+      return result.tools || [];
+    })(),
+    ROUTER_DISCOVERY_TIMEOUT_MS,
+    `Router discovery for namespace ${namespaceUuid}`,
+  )
+    .then((tools) => {
+      const entry = buildCacheEntry(tools, previousEntry);
+      cache.set(namespaceUuid, entry);
+      return entry;
+    })
+    .catch((error) => {
+      logger.error(
+        `Router discovery failed for namespace ${namespaceUuid}:`,
+        error,
+      );
+
+      const latestCached = cache.get(namespaceUuid) || previousEntry;
+      if (latestCached) {
+        const staleEntry = staleCacheEntry(latestCached, error);
+        cache.set(namespaceUuid, staleEntry);
+        return staleEntry;
+      }
+
+      const emptyEntry: RouterCacheEntry = {
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        groups: new Map(),
+        lastRefreshError: errorMessage(error),
+        lastRefreshFailedAt: Date.now(),
+        stale: true,
+        tools: [],
+      };
+      cache.set(namespaceUuid, emptyEntry);
+      return emptyEntry;
+    })
+    .finally(() => {
+      refreshes.delete(namespaceUuid);
+    });
+
+  refreshes.set(namespaceUuid, refresh);
+  return refresh;
+};
+
 export const getRouterToolGroups = async (
   namespaceUuid: string,
   sessionId: string,
@@ -353,20 +469,21 @@ export const getRouterToolGroups = async (
   const cached = cache.get(namespaceUuid);
   if (!bypassCache && cached && cached.expiresAt > Date.now()) return cached;
 
-  await metaMcpServerPool.getOpenApiServer(namespaceUuid);
+  const existingRefresh = refreshes.get(namespaceUuid);
+  if (existingRefresh) {
+    if (cached) return cached;
+    return await existingRefresh;
+  }
 
-  const { handlerContext, listToolsWithMiddleware } =
-    createMiddlewareEnabledHandlers(sessionId, namespaceUuid);
-  const request: ListToolsRequest = { method: "tools/list", params: {} };
-  const result = await listToolsWithMiddleware(request, handlerContext);
-  const tools = result.tools || [];
-  const entry: RouterCacheEntry = {
-    expiresAt: Date.now() + CACHE_TTL_MS,
-    groups: buildGroups(tools),
-    tools,
-  };
-  cache.set(namespaceUuid, entry);
-  return entry;
+  const refresh = refreshRouterToolGroups(namespaceUuid, sessionId, cached);
+  if (!bypassCache && cached) {
+    return {
+      ...cached,
+      stale: true,
+    };
+  }
+
+  return await refresh;
 };
 
 export const getRouterTools = async (
@@ -401,7 +518,23 @@ const executeDownstreamTool = async (
       arguments: args || {},
     },
   };
-  return await callToolWithMiddleware(request, handlerContext);
+  try {
+    return await withTimeout(
+      callToolWithMiddleware(request, handlerContext),
+      ROUTER_EXECUTION_TIMEOUT_MS,
+      `Router execution for tool ${tool.name}`,
+    );
+  } catch (error) {
+    logger.error(`Router execution failed for tool ${tool.name}:`, error);
+    return jsonResult(
+      {
+        error: "Tool execution failed",
+        message: errorMessage(error),
+        tool: tool.name,
+      },
+      true,
+    );
+  }
 };
 
 const handleBrandTool = async (

@@ -33,6 +33,11 @@ type RouterCallArgs = {
   limit?: number;
 };
 
+type ToolLookupResult =
+  | { status: "found"; tool: Tool }
+  | { status: "not_found" }
+  | { status: "ambiguous"; matchingTools: Tool[] };
+
 const CACHE_TTL_MS = 60_000;
 const cache = new Map<string, RouterCacheEntry>();
 
@@ -124,6 +129,10 @@ const genericRouterTools: Tool[] = [
   },
 ];
 
+const genericRouterToolNames = new Set(
+  genericRouterTools.map((tool) => tool.name),
+);
+
 const normalizeBrand = (brand: string) => brand.trim().toLowerCase();
 
 const getBrandFromToolName = (toolName: string): string | null => {
@@ -200,18 +209,76 @@ const findTool = (
   groups: Map<string, ToolGroup>,
   toolName: string,
   brand?: string,
-): Tool | undefined => {
+): ToolLookupResult => {
   const normalizedBrand = brand ? normalizeBrand(brand) : undefined;
   const candidates = normalizedBrand
     ? groups.get(normalizedBrand)?.tools || []
     : Array.from(groups.values()).flatMap((group) => group.tools);
   const normalizedToolName = toolName.trim().toLowerCase();
 
-  return candidates.find((tool) => {
-    const fullName = tool.name.toLowerCase();
-    const shortName = stripBrandPrefix(tool.name).toLowerCase();
-    return fullName === normalizedToolName || shortName === normalizedToolName;
-  });
+  if (!normalizedToolName) return { status: "not_found" };
+
+  if (normalizedToolName.includes("__")) {
+    const fullNameMatch = candidates.find(
+      (tool) => tool.name.toLowerCase() === normalizedToolName,
+    );
+    return fullNameMatch
+      ? { status: "found", tool: fullNameMatch }
+      : { status: "not_found" };
+  }
+
+  const shortNameMatches = candidates.filter(
+    (tool) => stripBrandPrefix(tool.name).toLowerCase() === normalizedToolName,
+  );
+
+  if (shortNameMatches.length === 1) {
+    return { status: "found", tool: shortNameMatches[0] };
+  }
+
+  if (shortNameMatches.length > 1) {
+    return { status: "ambiguous", matchingTools: shortNameMatches };
+  }
+
+  return { status: "not_found" };
+};
+
+const getBrandToolNameMap = (
+  groups: Map<string, ToolGroup>,
+): Map<string, string> => {
+  const usedToolNames = new Set(genericRouterToolNames);
+  const brandToolNameMap = new Map<string, string>();
+
+  for (const brand of Array.from(groups.keys()).sort()) {
+    const preferredName = genericRouterToolNames.has(brand)
+      ? `brand_${brand}`
+      : brand;
+    let toolName = preferredName;
+    let suffix = 2;
+
+    while (usedToolNames.has(toolName)) {
+      toolName = `${preferredName}_${suffix}`;
+      suffix += 1;
+    }
+
+    usedToolNames.add(toolName);
+    brandToolNameMap.set(brand, toolName);
+  }
+
+  return brandToolNameMap;
+};
+
+const getBrandForRouterToolName = (
+  groups: Map<string, ToolGroup>,
+  toolName: string,
+): string | undefined => {
+  const brandToolNameMap = getBrandToolNameMap(groups);
+  const normalizedToolName = normalizeBrand(toolName);
+
+  for (const [brand, routerToolName] of brandToolNameMap.entries()) {
+    if (routerToolName === normalizedToolName) return brand;
+  }
+
+  return undefined;
 };
 
 const matchTools = (tools: Tool[], intent?: string, limit = 10): Tool[] => {
@@ -307,10 +374,11 @@ export const getRouterTools = async (
   sessionId: string,
 ): Promise<Tool[]> => {
   const { groups } = await getRouterToolGroups(namespaceUuid, sessionId);
+  const brandToolNameMap = getBrandToolNameMap(groups);
   const brandTools: Tool[] = Array.from(groups.values())
     .sort((a, b) => a.brand.localeCompare(b.brand))
     .map((group) => ({
-      name: group.brand,
+      name: brandToolNameMap.get(group.brand) || group.brand,
       description: `${group.brand} router for ${group.tools.length} downstream tool${group.tools.length === 1 ? "" : "s"}. Provide intent and optional arguments/tool/mode to discover schemas or execute a matching downstream tool.`,
       inputSchema: brandToolInputSchema,
     }));
@@ -360,9 +428,11 @@ const handleBrandTool = async (
 
   const mode = args.mode || "auto";
   const limit = args.limit || 10;
-  const explicitTool = args.tool
+  const explicitToolResult = args.tool
     ? findTool(groups, args.tool, normalizedBrand)
-    : undefined;
+    : ({ status: "not_found" } as ToolLookupResult);
+  const explicitTool =
+    explicitToolResult.status === "found" ? explicitToolResult.tool : undefined;
 
   if (args.tool && !explicitTool) {
     return jsonResult(
@@ -471,27 +541,51 @@ export const callRouterTool = async (
   }
 
   if (toolName === "get_tool_schema") {
-    const tool = findTool(
+    const toolResult = findTool(
       groups,
       String(args.tool || ""),
       typeof args.brand === "string" ? args.brand : undefined,
     );
-    if (!tool) {
+
+    if (toolResult.status === "ambiguous") {
+      return jsonResult(
+        {
+          needs_brand: true,
+          error: `Tool '${String(args.tool || "")}' is ambiguous. Provide brand or use a fully-qualified tool name.`,
+          matching_tools: toolResult.matchingTools.map(summarizeTool),
+        },
+        true,
+      );
+    }
+
+    if (toolResult.status === "not_found") {
       return jsonResult(
         { error: `Tool '${String(args.tool || "")}' not found.` },
         true,
       );
     }
-    return jsonResult({ tool: summarizeTool(tool) });
+    return jsonResult({ tool: summarizeTool(toolResult.tool) });
   }
 
   if (toolName === "execute_tool") {
-    const tool = findTool(
+    const toolResult = findTool(
       groups,
       String(args.tool || ""),
       typeof args.brand === "string" ? args.brand : undefined,
     );
-    if (!tool) {
+
+    if (toolResult.status === "ambiguous") {
+      return jsonResult(
+        {
+          needs_brand: true,
+          error: `Tool '${String(args.tool || "")}' is ambiguous. Provide brand or use a fully-qualified tool name.`,
+          matching_tools: toolResult.matchingTools.map(summarizeTool),
+        },
+        true,
+      );
+    }
+
+    if (toolResult.status === "not_found") {
       return jsonResult(
         { error: `Tool '${String(args.tool || "")}' not found.` },
         true,
@@ -500,16 +594,17 @@ export const callRouterTool = async (
     return await executeDownstreamTool(
       namespaceUuid,
       sessionId,
-      tool,
+      toolResult.tool,
       (args.arguments as Record<string, unknown> | undefined) || {},
     );
   }
 
-  if (groups.has(normalizeBrand(toolName))) {
+  const brandToolName = getBrandForRouterToolName(groups, toolName);
+  if (brandToolName) {
     return await handleBrandTool(
       namespaceUuid,
       sessionId,
-      toolName,
+      brandToolName,
       args as RouterCallArgs,
     );
   }

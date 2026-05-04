@@ -30,11 +30,25 @@ const cleanupSession = async (
   transport?: StreamableHTTPServerTransport,
 ) => {
   const sessionTransport = transport || sessionManager.getSession(sessionId);
-  if (sessionTransport) {
-    await sessionTransport.close();
+
+  try {
+    if (sessionTransport) {
+      await sessionTransport.close();
+    }
+  } catch (error) {
+    logger.error(
+      `Error closing router transport for session ${sessionId}:`,
+      error,
+    );
+  } finally {
+    sessionManager.removeSession(sessionId);
   }
-  sessionManager.removeSession(sessionId);
-  await mcpServerPool.cleanupSession(sessionId);
+
+  try {
+    await mcpServerPool.cleanupSession(sessionId);
+  } catch (error) {
+    logger.error(`Error cleaning router MCP pool session ${sessionId}:`, error);
+  }
 };
 
 toolRouter.get(

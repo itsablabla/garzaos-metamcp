@@ -61,6 +61,11 @@ Dedicated Streamable HTTP MCP endpoints:
       "transport": "http",
       "url": "https://metamcp.garza.online/metamcp/hyperbrowser/router/mcp",
       "headers": { "X-API-Key": "sk_mt_UHhCj8J2zLtxSGK4GG0md3EN26Gi11c5LT81JDVYMrrXVHNZHdXzsmN9lNvTxugC" }
+    },
+    "metamcp-prompts-chat": {
+      "transport": "http",
+      "url": "https://metamcp.garza.online/metamcp/prompts-chat/router/mcp",
+      "headers": { "X-API-Key": "sk_mt_UHhCj8J2zLtxSGK4GG0md3EN26Gi11c5LT81JDVYMrrXVHNZHdXzsmN9lNvTxugC" }
     }
   }
 }
@@ -82,9 +87,21 @@ The aggregate endpoint exists but is not preferred until broken upstreams are re
 }
 ```
 
+## Request preparation workflow
+
+Before submitting any substantial request to another agent, MCP tool, automation, or external service:
+
+1. Query the prompt database through `prompts-chat` for reusable prompts that match the task, domain, target tool, or desired output format.
+2. If a relevant prompt exists, adapt it to the current request instead of drafting from scratch.
+3. If no relevant prompt exists, use `prompts-chat` to improve/structure the request, then save the improved prompt when it is likely to be reusable.
+4. Query the skills database through `prompts-chat` for available skills related to the task.
+5. If a skill exists, read and follow it before acting.
+6. If no skill exists but the task is recurring or specialized, use the skills MCP/database to create, download, or store a reusable skill for future agents, then proceed.
+7. Do not block urgent or simple work indefinitely if `prompts-chat` is unavailable; continue with best effort and note the missed optimization opportunity.
+
 ## Tool selection policy
 
-- Use `prompts-chat` to improve ambiguous or high-impact prompts before acting. If unavailable or timing out, continue without blocking.
+- Use `prompts-chat` as the prompt and skills database. Check it before every substantial request, not only ambiguous requests.
 - Use `context7` before writing SDK/library/framework code. Resolve the library ID first, then query docs.
 - Use `firecrawl` for static web search/scraping/extraction.
 - Use `hyperbrowser` for JavaScript-heavy pages, browser automation, screenshots, logins, and SPA workflows.
@@ -98,7 +115,7 @@ The aggregate endpoint exists but is not preferred until broken upstreams are re
 ## Known unreliable or environment-bound tools
 
 - `beeper-local` and `beeper-oakhost` currently expose zero/unknown tools or depend on local network tunnels. Do not rely on them for critical flows.
-- `prompts-chat` may time out from the MetaMCP VM. Use it when available, but do not let it block urgent work.
+- `prompts-chat` may time out from the MetaMCP VM. It is still the required first choice for prompt/skill lookup, but do not let it block urgent work.
 - Endpoints that reference `oakhost`, `100.121.182.67`, or local Beeper/Proton Bridge services may fail from cloud-hosted agents unless the relevant Tailscale tunnel is reachable.
 
 ## Streamable HTTP notes
